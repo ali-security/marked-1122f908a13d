@@ -1,70 +1,67 @@
 name: "Tests"
 on:
-  pull_request:
-  push:
-    branches:
-      - master
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional space-separated spec file selector'
+        required: false
+        default: ''
 
 jobs:
   Test:
     if: "!contains(github.event.head_commit.message, '[skip ci]')"
     strategy:
+      fail-fast: false
       matrix:
-        node_version: ['lts/*', 'node']
+        # upstream's own matrix was ['lts/*', 'node'], resolved here to the
+        # versions those labels named at the 2021-05-27 release. Node 8 cannot
+        # run the project's pinned jasmine@3.7.0 (its loader.js uses dynamic
+        # import(), a SyntaxError before Node 12.17), so engines.node's 8.16.2
+        # floor is stale and was never exercised by upstream CI.
+        node_version: [14, 16]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
       - name: Install Node
-        uses: dcodeIO/setup-node-nvm@master
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node_version }}
-      - name: Install Dependencies
-        run: npm ci
-      - name: Run Unit Tests 👩🏽‍💻
-        run: npm run test:unit
-      - name: Run Spec Tests 👩🏽‍💻
-        run: npm run test:specs
-
-  Lint:
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v2
-      - name: Install Dependencies
-        run: npm ci
-      - name: Lint ✨
-        run: npm run test:lint
-
-  Release:
-    needs: [Test, Lint]
-    if: |
-      github.ref == 'refs/heads/master' &&
-      github.event.repository.fork == false
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v2
-      - name: Install Dependencies
-        run: npm ci
-      - name: Build 🗜️
+      - name: Pin npm registry to release date
         run: |
-          npm run build
-          if ! git diff --quiet; then
-            git config --global user.email "<>"
-            git config --global user.name "MarkedJS bot"
-            git commit -am "🗜️ build [skip ci]"
+          npm config set registry https://time-machines-npm.sealsecurity.io/
+          npm config set //time-machines-npm.sealsecurity.io/:_authToken=2021-05-27T16:17:12.429000Z
+      - name: Install Dependencies
+        run: npm ci
+      # marked.min.js is uglify output derived from lib/marked.js and is shipped
+      # in the tarball, so it has to be regenerated from the patched bundle
+      # before the tests read it and before npm pack collects it.
+      - name: Minify browser bundle 🗜️
+        run: npm run minify
+      - name: Run Unit Tests 👩🏽‍💻
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            npm run test:unit -- ${{ inputs.test-filter }}
+          else
+            npm run test:unit
           fi
-      - name: Release 🎉
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npx semantic-release
-
-  Skip:
-    if: contains(github.event.head_commit.message, '[skip ci]')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Skip CI 🚫
-        run: echo skip ci
+      - name: Run Spec Tests 👩🏽‍💻
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            npm run test:specs -- ${{ inputs.test-filter }}
+          else
+            npm run test:specs
+          fi
+      - name: Pack tarball 📦
+        if: matrix.node_version == 14
+        run: |
+          npm i -g npm@7.12.0
+          npm pack
+      - name: Upload tarball
+        if: matrix.node_version == 14
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarball
+          path: marked-*.tgz
+          if-no-files-found: error
